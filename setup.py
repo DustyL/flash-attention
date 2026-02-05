@@ -68,7 +68,7 @@ NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;103;110;120").split(";")
 
 
 def get_platform():
@@ -99,8 +99,9 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
     """
     Adds -gencode flags based on nvcc capabilities:
       - sm_80/90 (regular)
-      - sm_100/120 on CUDA >= 12.8
-      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
+      - sm_100/103/120 on CUDA >= 12.8
+      - Use 100f/103f/120f on CUDA >= 12.9/13.0 (Blackwell family-specific)
+      - sm_103 (B300) requires CUDA >= 12.8, uses 103f on CUDA >= 13.0
       - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
       - Embed PTX for newest arch for forward compatibility
     """
@@ -120,6 +121,15 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                 cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
             else:
                 cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
+
+        # SM103 (B300) - Blackwell variant
+        if "103" in archs:
+            # CUDA 13.0+ supports compute_103f (family-specific)
+            if bare_metal_version >= Version("13.0"):
+                cc_flag += ["-gencode", "arch=compute_103f,code=sm_103"]
+            else:
+                # CUDA 12.8/12.9 use compute_103 without family-specific suffix
+                cc_flag += ["-gencode", "arch=compute_103,code=sm_103"]
 
         if "120" in archs:
             # sm_120 is supported in CUDA 12.8/12.9+ toolkits
