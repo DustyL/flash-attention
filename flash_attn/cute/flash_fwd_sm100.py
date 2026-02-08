@@ -29,6 +29,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -234,7 +235,13 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = 4 if self.q_dtype.width == 8 or self.q_stage == 1 else 3
+        self.kv_stage = (
+            4
+            if (self.q_dtype.width == 8 or self.q_stage == 1)
+            and self.head_dim_padded <= 128
+            and self.head_dim_v_padded <= 128
+            else 3
+        )
         self.acc_stage = 1
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
@@ -291,16 +298,7 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
-        # Assume all strides are divisible by 128 bits except the last stride
-        # Skip assume for Python ints (e.g., stride=0 from GQA expand)
-        new_stride = lambda t: (
-            *(s if isinstance(s, int) else cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
-            t.stride[-1],
-        )
-        mQ, mK, mV, mO = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mQ, mK, mV, mO)
-        ]
+        mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
@@ -2341,7 +2339,7 @@ class FlashAttentionForwardSm100:
             tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
             cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
@@ -2422,7 +2420,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
-                tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
@@ -2430,10 +2428,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)

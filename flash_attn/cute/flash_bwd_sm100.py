@@ -14,7 +14,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
+import quack.activation
 from flash_attn.cute import utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
@@ -411,29 +413,7 @@ class FlashAttentionBackwardSm100:
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
             assert self.dv_dtype.width == 32, "Must accumulate dV in float precision for GQA"
 
-        # Assume all strides are divisible by 128 bits except the last stride
-        # Skip assume for Python ints (e.g., stride=0 from GQA expand)
-        new_stride = lambda t: (
-            *(
-                s if isinstance(s, int) else cute.assume(s, divby=128 // t.element_type.width)
-                for s in t.stride[:-1]
-            ),
-            t.stride[-1],
-        )
-        (
-            mdQaccum,
-            mdK,
-            mdV,
-        ) = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (
-                mdQaccum,
-                mdK,
-                mdV,
-            )
-        ]
+        mdQaccum, mdK, mdV = [assume_tensor_aligned(t) for t in (mdQaccum, mdK, mdV)]
 
         # (b, s, n, h) --> (s, h, n, b) or (t, n, h) -> (t, h, n)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
@@ -2193,7 +2173,7 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrLSE, offset=2 * v),
                                 utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
                             )
-                        tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.fma_packed_f32x2(
+                        tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
                             ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
                             (softmax_scale_log2, softmax_scale_log2),
                             (-lse_pair[0], -lse_pair[1]),
@@ -2254,10 +2234,12 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v),
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                             )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = utils.sub_packed_f32x2(
-                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
+                            quack.activation.sub_packed_f32x2(
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                            )
                         )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = utils.mul_packed_f32x2(
+                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                         )
@@ -2298,9 +2280,7 @@ class FlashAttentionBackwardSm100:
 
                 if const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                )
+                cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
 
                 # with cute.arch.elect_one():
@@ -2549,9 +2529,7 @@ class FlashAttentionBackwardSm100:
                     )
                     cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
                     # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                    )
+                    cute.arch.fence_view_async_shared()
                     # semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
                         if const_expr(self.spt):
@@ -2898,7 +2876,7 @@ class FlashAttentionBackwardSm100:
             # RMEM -- scale and convert
             if const_expr(scale is not None):
                 for i in cutlass.range(cute.size(tdKVrdKV_t2r.shape) // 2, unroll_full=True):
-                    tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = utils.mul_packed_f32x2(
+                    tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = cute.arch.mul_packed_f32x2(
                         (tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1]), (scale, scale)
                     )
             tdKVrdKV = cute.make_fragment(tdKVrdKV_t2r.shape, self.dv_dtype)  # (32 columns)
@@ -2907,9 +2885,7 @@ class FlashAttentionBackwardSm100:
             # RMEM -> SMEM -- copy, fence and barrier
             tdKVrdKV_r2s = cute.make_tensor(tdKVrdKV.iterator, tdKVsdKV_r2s.shape)
             cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
             # SMEM -> GMEM
@@ -2931,9 +2907,7 @@ class FlashAttentionBackwardSm100:
                 )
 
             # Barrier since all warps need to wait for SMEM to be freed
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
             )

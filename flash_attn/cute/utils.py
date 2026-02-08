@@ -5,7 +5,6 @@ import hashlib
 import inspect
 import re
 from typing import Type, Callable, Optional, Tuple, overload
-from functools import partial
 
 import cutlass
 import cutlass.cute as cute
@@ -16,16 +15,7 @@ from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
 
-# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-sub_packed_f32x2 = partial(
-    cute.arch.calc_packed_f32x2_op,
-    src_c=None,
-    calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN,
-)
+import quack.activation
 
 
 def hash_callable(func: Callable, set_cute_hash=True) -> str:
@@ -418,20 +408,20 @@ def fadd_reduce(
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
         local_sum_0 = (
-            add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
-            # add_packed_f32x2((init_val / 2, init_val / 2), (res[0], res[1]))
+            cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+            # cute.arch.add_packed_f32x2((init_val / 2, init_val / 2), (res[0], res[1]))
             if const_expr(init_val is not None)
             else (res[0], res[1])
         )
         local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
         for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
-            local_sum[0] = add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
-            local_sum[1] = add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
-            local_sum[2] = add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
-            local_sum[3] = add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
-        local_sum[0] = add_packed_f32x2(local_sum[0], local_sum[1])
-        local_sum[2] = add_packed_f32x2(local_sum[2], local_sum[3])
-        local_sum[0] = add_packed_f32x2(local_sum[0], local_sum[2])
+            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
+            local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
+            local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
+            local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[1])
+        local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], local_sum[3])
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[2])
         return local_sum[0][0] + local_sum[0][1]
 
 
@@ -460,24 +450,6 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
-    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
-    flat_stride = cute.flatten_to_tuple(x.stride)
-    assert len(flat_coord_i64) == len(flat_stride), (
-        "Coordinate and stride must have the same length"
-    )
-    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    byte_offset = offset * x.element_type.width // 8
-    return cute.make_ptr(
-        x.element_type,
-        x.iterator.toint() + byte_offset,
-        x.memspace,
-        assumed_align=x.iterator.alignment,
-    )
 
 
 @cute.jit
@@ -652,7 +624,7 @@ def evaluate_polynomial_2(
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])
     for i in cutlass.range_constexpr(deg - 1, -1, -1):
-        out = fma_packed_f32x2(out, (x, y), (poly[i], poly[i]))
+        out = cute.arch.fma_packed_f32x2(out, (x, y), (poly[i], poly[i]))
     return out
 
 
@@ -733,13 +705,13 @@ def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
-    xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
-    )
+    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
-    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_rounded_back = quack.activation.sub_packed_f32x2(
+        xy_rounded, (fp32_round_int, fp32_round_int)
+    )
+    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly_ex2_deg3, loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
@@ -806,44 +778,6 @@ def domain_offset_aligned(
         assumed_align=tensor.iterator.alignment,
     )
     return cute.make_tensor(new_ptr, tensor.layout)
-
-
-@dsl_user_op
-def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
-    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
-    flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(flat_stride), (
-        "Coordinate and stride must have the same length"
-    )
-    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    new_ptr = cute.make_ptr(
-        tensor.element_type,
-        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
-        tensor.memspace,
-        assumed_align=tensor.iterator.max_alignment,
-    )
-    return cute.make_tensor(new_ptr, tensor.layout)
-
-
-@dsl_user_op
-def coord_offset_i64(
-    tensor: cute.Tensor, idx: cute.typing.Int, dim: int, *, loc=None, ip=None
-) -> cute.Tensor:
-    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
-    assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    new_ptr = cute.make_ptr(
-        tensor.element_type,
-        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
-        tensor.memspace,
-        assumed_align=tensor.iterator.max_alignment,
-    )
-    new_layout = cute.slice_(
-        tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1))
-    )
-    return cute.make_tensor(new_ptr, new_layout)
 
 
 @cute.jit
