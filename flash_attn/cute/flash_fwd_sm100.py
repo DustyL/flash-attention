@@ -951,13 +951,13 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
             if warp_idx == self.empty_warp_ids[i]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.load(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -985,7 +985,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
             # if warp_idx == self.mma_warp_id or warp_idx == self.empty_warp_ids:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
             if warp_idx == self.mma_warp_id:
@@ -1028,7 +1028,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(not self.use_correction_warps_for_epi):
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
                 self.epilogue_s2g(
                     mO,
                     sO,
@@ -1049,7 +1049,7 @@ class FlashAttentionForwardSm100:
             (const_expr(self.q_stage == 1) and warp_idx <= self.softmax0_warp_ids[-1])
         ):
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.setmaxregister_increase(self.num_regs_softmax)
             softmax_loop = partial(
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
@@ -1096,7 +1096,7 @@ class FlashAttentionForwardSm100:
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+            cute.arch.setmaxregister_decrease(self.num_regs_correction)
             self.correction_loop(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -1863,7 +1863,7 @@ class FlashAttentionForwardSm100:
             #     )
             #     LN2 = math.log(2.0)
             #     lse = (
-            #         (softmax.row_max[0] * softmax.scale_log2 + utils.log2f(softmax.row_sum[0])) * LN2
+            #         (softmax.row_max[0] * softmax.scale_log2 + cute.math.log2(softmax.row_sum[0], fastmath=True)) * LN2
             #         if not acc_O_mn_row_is_zero_or_nan else -Float32.inf
             #     )
             #     if const_expr(not seqlen.has_cu_seqlens_q):
@@ -2004,7 +2004,7 @@ class FlashAttentionForwardSm100:
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
-        # acc_scale = cute.arch.exp2(acc_scale_)
+        # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
     @cute.jit
@@ -2170,8 +2170,8 @@ class FlashAttentionForwardSm100:
                                 row_max = sink_val * (LOG2_E / softmax_scale_log2)
                                 row_sum = Float32(1.0)
                             else:
-                                row_sum += utils.exp2f(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2
+                                row_sum += cute.math.exp2(
+                                    sink_val * LOG2_E - row_max * softmax_scale_log2, fastmath=True
                                 )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
@@ -2276,7 +2276,7 @@ class FlashAttentionForwardSm100:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + utils.log2f(row_sum)) * LN2
+                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )

@@ -15,6 +15,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
 import quack.activation
+from quack import layout_utils
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
@@ -417,37 +418,39 @@ class FlashAttentionBackwardSm100:
 
         # (b, s, n, h) --> (s, h, n, b) or (t, n, h) -> (t, h, n)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mdO = [utils.select(t, mode=QO_layout_transpose) for t in (mQ, mdO)]
+        mQ, mdO = [layout_utils.select(t, mode=QO_layout_transpose) for t in (mQ, mdO)]
 
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mK, mV = [utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
+        mK, mV = [layout_utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
 
         # (b, n, s) --> (s, n, b) or (n, t) --> (t, n)
         LSE_dPsum_dQaccum_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mLSE, mdPsum, mdQaccum = [
-            utils.select(t, mode=LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)
+            layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose)
+            for t in (mLSE, mdPsum, mdQaccum)
         ]
 
         if const_expr(not self.dKV_postprocess):
             layout_dKV_transpose = KV_layout_transpose
         else:
             layout_dKV_transpose = [2, 1, 0] if const_expr(mCuSeqlensK is None) else [1, 0]
-        mdK, mdV = [utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
+        mdK, mdV = [layout_utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
         # (s, h, n, b) --> (h, s, n, b) or (t, h, n) -> (h, t, b)
         dO_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensQ is None) else [1, 0, 2]
-        mdO = utils.select(mdO, mode=dO_transpose)
+        mdO = layout_utils.select(mdO, mode=dO_transpose)
 
         # (b, n, block, stage) -> (block, stage, n, b)
         semaphore_transpose = [2, 3, 1, 0]
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
-            mdQ_semaphore = utils.select(mdQ_semaphore, mode=semaphore_transpose)
+            mdQ_semaphore = layout_utils.select(mdQ_semaphore, mode=semaphore_transpose)
 
         if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
-                utils.select(t, mode=semaphore_transpose) for t in (mdK_semaphore, mdV_semaphore)
+                layout_utils.select(t, mode=semaphore_transpose)
+                for t in (mdK_semaphore, mdV_semaphore)
             ]
         else:
             mdK_semaphore = None
@@ -954,7 +957,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group_compute,
             tx_count=self.tma_copy_bytes["LSE"],
             # cta_layout_vmnk=cluster_layout_vmnk,
-            # init_wait=False,
+            defer_sync=True,
         )
         pipeline_dPsum = cutlass.pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.dPsum_mbar_ptr.data_ptr(),
@@ -963,7 +966,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group_compute,
             tx_count=self.tma_copy_bytes["dPsum"],
             # cta_layout_vmnk=cluster_layout_vmnk,
-            # init_wait=False,
+            defer_sync=True,
         )
         pipeline_Q = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.Q_mbar_ptr.data_ptr(),
@@ -972,7 +975,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["Q"],
             cta_layout_vmnk=cluster_layout_vmnk,
-            init_wait=False,
+            defer_sync=True,
         )
         pipeline_dO = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.dO_mbar_ptr.data_ptr(),
@@ -981,7 +984,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["dO"],
             cta_layout_vmnk=cluster_layout_vmnk,
-            init_wait=True,
+            defer_sync=False,
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
@@ -1090,18 +1093,18 @@ class FlashAttentionBackwardSm100:
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  EPI
         # (14)
         if warp_idx == self.epi_warp_id:
             # currently no-op, could use for tma store/reduce
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  LOAD
         # (13)
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1138,7 +1141,7 @@ class FlashAttentionBackwardSm100:
         #  MMA
         # (12)
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
 
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
@@ -1191,7 +1194,7 @@ class FlashAttentionBackwardSm100:
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_compute)  # 8 warps
+            cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
             self.compute_loop(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1236,7 +1239,7 @@ class FlashAttentionBackwardSm100:
         # Reduce
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_reduce)
+            cute.arch.setmaxregister_increase(self.num_regs_reduce)
             self.dQacc_reduce(
                 mdQaccum,
                 sdQaccum,
@@ -1956,8 +1959,8 @@ class FlashAttentionBackwardSm100:
         )
         # if const_expr(self.SdP_swapAB):
         if const_expr(True):
-            sLSE_2D = utils.transpose_view(sLSE_2D)
-            sdPsum_2D = utils.transpose_view(sdPsum_2D)
+            sLSE_2D = layout_utils.transpose_view(sLSE_2D)
+            sdPsum_2D = layout_utils.transpose_view(sdPsum_2D)
 
         # tix: [128...384]  8 warps
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())  # 4-11
