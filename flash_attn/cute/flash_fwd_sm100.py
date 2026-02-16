@@ -27,10 +27,11 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
+from quack import copy_utils
+
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import copy_utils
 import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
@@ -47,13 +48,13 @@ from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from cutlass.cute import FastDivmodDivisor
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
-    ParamsBase,
 )
 
 
@@ -1734,8 +1735,8 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
             )
 
-            if has_work:
-                # Softmax acts as the producer: wait until correction signals the stage is empty
+            if const_expr(self.use_block_sparsity) or has_work:
+                # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
                 )
@@ -1785,6 +1786,7 @@ class FlashAttentionForwardSm100:
                         ] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
+                    # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
